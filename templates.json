@@ -1,0 +1,17 @@
+[
+  "{Hey|Hi|Hello} {name}! {Saw|Noticed|Came across} your {article|feature|piece|story} {on|in} {outlet} and had a {quick question|question} for you!",
+
+  "{Hey|Hi|Hello} {name}! {Congrats|Congratulations|Big congrats|Huge congrats} on {being featured in|your feature in|the piece in|the article in} {outlet}. Had a quick question for you!",
+
+  "{Hey|Hi|Hello} {name}! {Just saw|Just noticed|Came across} your {feature|story|article|piece} in {outlet}. Had a quick question if you don't mind!",
+
+  "{Hey|Hi|Hello} {name}! {We saw|We noticed|We came across} your {article|feature|piece|story} on {outlet} and {had a quick question|wanted to ask you something quick|had something we wanted to ask}!",
+
+  "{Hey|Hi|Hello} {name}! {Congrats|Congratulations|Big congrats} on the {outlet} {feature|article|piece|story}! Had a quick question for you {🙌|👋|}",
+
+  "{Hey|Hi|Hello} {name}! {Saw|Read|Noticed} your {article|feature|write-up|piece|story} {on|in} {outlet}. {Wanted to reach out|Had to reach out} with a quick question!",
+
+  "{Hey|Hi|Hello} {name}! {Really cool|Awesome|Great|Super cool} {feature|article|piece|story} in {outlet}! Had a {quick question|question} I wanted to ask you {🙌|👋|}",
+
+  "{Hey|Hi|Hello} {name}! {Saw your|Noticed your|Came across your} {feature|article|story|piece} in {outlet} and {had to reach out|wanted to reach out}. Quick question for you!"
+]

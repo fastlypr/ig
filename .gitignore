@@ -1,0 +1,43 @@
+# ── Private data — NEVER commit ──────────────────────────────────────────────
+accounts.json
+sessions/
+dm_log.csv
+results.csv
+usernames.txt
+leads/*.csv
+!leads/.gitkeep
+*.session.json
+*_device.json
+*_warmup.json
+*_session.json
+
+# API keys / secrets
+rapidapi_key.txt
+*.key
+*.pem
+.env
+.env.*
+
+# Pre-existing data files in this folder
+instagram_bulk.csv
+instagram_viipan.csv
+instagram_scraper.js
+test_output.csv
+test_usernames.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+build/
+dist/
+venv/
+myenv/
+.venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
