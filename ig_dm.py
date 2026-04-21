@@ -16,6 +16,7 @@ import time
 import random
 import requests
 import io
+import argparse
 from datetime import date, datetime, timedelta
 from instagrapi.exceptions import (
     ClientThrottledError, RateLimitError,
@@ -528,7 +529,15 @@ def pick_accounts(all_accounts, cfg_data):
 
 
 def main():
+    # Parse CLI args
+    parser = argparse.ArgumentParser(description="Instagram DM sender with warmup & batch scheduling")
+    parser.add_argument("--auto",    action="store_true", help="Non-interactive mode (for systemd/background). Uses all configured accounts, follows planned schedule.")
+    parser.add_argument("--account", type=str, default=None, help="Use only this specific account (comma-separated for multiple)")
+    args = parser.parse_args()
+
     print("\n── ig_dm — Instagram DM Sender (All-Day Mode) ──\n")
+    if args.auto:
+        print("[*] Running in AUTO mode (non-interactive)\n")
 
     # Load templates (once — reused across days)
     templates = load_templates()
@@ -543,8 +552,20 @@ def main():
         print("[!] No accounts configured. Run `python ig_auth.py` first.")
         return
 
-    # ── Account picker ────────────────────────────────────────────────────
-    accounts = pick_accounts(all_accounts, cfg_data)
+    # ── Account selection ─────────────────────────────────────────────────
+    if args.account:
+        requested = [a.strip().lower() for a in args.account.split(",")]
+        accounts  = [a for a in requested if a in all_accounts]
+        missing   = [a for a in requested if a not in all_accounts]
+        if missing:
+            print(f"[!] Accounts not found: {', '.join('@'+a for a in missing)}")
+    elif args.auto:
+        # Non-interactive → use all accounts
+        accounts = all_accounts
+        print(f"[*] Auto mode: using all {len(accounts)} configured account(s)")
+    else:
+        accounts = pick_accounts(all_accounts, cfg_data)
+
     if not accounts:
         print("[!] No accounts selected. Exiting.")
         return
@@ -616,8 +637,8 @@ def main():
             for idx, (start_time, size) in enumerate(batches, 1):
                 print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
 
-            # Offer to start first batch immediately (for testing / first-run)
-            if batches and (batches[0][0] - datetime.now()).total_seconds() > 600:
+            # Offer to start first batch immediately (interactive mode only)
+            if not args.auto and batches and (batches[0][0] - datetime.now()).total_seconds() > 600:
                 first_delay_min = int((batches[0][0] - datetime.now()).total_seconds() // 60)
                 print(f"\n[*] First batch is {first_delay_min} min away.")
                 start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()

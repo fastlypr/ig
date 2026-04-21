@@ -1,0 +1,21 @@
+[Unit]
+Description=Instagram DM Sender (ig_dm) — runs all-day in batches
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ig
+ExecStart=/root/ig/venv/bin/python /root/ig/ig_dm.py --auto
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/ig-dm.log
+StandardError=append:/var/log/ig-dm.log
+
+# Survive server reboot + auto-restart on crash
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
