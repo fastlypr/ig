@@ -4,7 +4,6 @@ sessions/
 dm_log.csv
 results.csv
 usernames.txt
-leads/*.csv
 !leads/.gitkeep
 *.session.json
 *_device.json
