@@ -130,6 +130,52 @@ def _proxy_usage(cfg_data):
     return usage
 
 
+# ── Interactive proxy picker (reused by add & cookie-import) ──────────────────
+
+def _pick_proxy_interactive(cfg_data):
+    """Prompt user to pick/add a proxy. Mutates cfg_data['proxy_pool'] if user adds one.
+    Returns the chosen proxy string, or None."""
+    use_proxy = input("\nUse a proxy for this account? (y/n): ").strip().lower()
+    if use_proxy != "y":
+        print("[*] No proxy — connecting directly.")
+        return None
+
+    pool  = cfg_data.get("proxy_pool", [])
+    usage = _proxy_usage(cfg_data)
+
+    if pool:
+        print("\n── Available proxies ──")
+        for idx, p in enumerate(pool, 1):
+            accs = usage.get(p, [])
+            tag  = f"  ← {', '.join('@'+a for a in accs)}" if accs else "  ← unassigned"
+            print(f"  {idx}. {p}{tag}")
+        print(f"  {len(pool)+1}. Add a new proxy")
+        print(f"  0. Skip (no proxy)")
+
+        choice = input("Choice: ").strip()
+        if choice == "0":
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(pool):
+            chosen = pool[int(choice) - 1]
+            print(f"[+] Using proxy: {chosen}")
+            return chosen
+        if choice.isdigit() and int(choice) == len(pool) + 1:
+            new_proxy = input("Proxy URL (http://... or socks5h://...): ").strip()
+            if new_proxy:
+                cfg_data["proxy_pool"].append(new_proxy)
+                print(f"[+] Added and assigned: {new_proxy}")
+                return new_proxy
+        print("[!] Invalid choice — continuing without proxy.")
+        return None
+
+    new_proxy = input("Enter proxy URL (http://user:pass@host:port or socks5h://...): ").strip()
+    if new_proxy:
+        cfg_data["proxy_pool"].append(new_proxy)
+        print(f"[+] Added to pool: {new_proxy}")
+        return new_proxy
+    return None
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_client(account: str = None, proxy: str = None) -> Client:
@@ -161,13 +207,32 @@ def get_client(account: str = None, proxy: str = None) -> Client:
 
     cl = _build_client(device_file, session_file, use_proxy)
 
+    is_cookie_auth = (acc.get("auth_method") == "cookie") or not password
+
     if os.path.exists(session_file):
+        if is_cookie_auth:
+            # Cookie-only account — trust saved session, verify lightly
+            try:
+                cl.get_timeline_feed()
+                print(f"[+] Cookie session active for @{username}")
+                return cl
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cookie session expired/invalid for @{username} ({e}). "
+                    f"Re-import cookies via `python ig_auth.py` → option 7."
+                )
         try:
             cl.login(username, password)
             print(f"[+] Logged in via saved session as @{cl.username}")
             return cl
         except (LoginRequired, Exception) as e:
             print(f"[!] Session expired for @{username} ({e}). Re-logging in...")
+
+    if is_cookie_auth:
+        raise RuntimeError(
+            f"No session file for cookie-auth @{username}. "
+            f"Re-import cookies via `python ig_auth.py` → option 7."
+        )
 
     _do_login(cl, username, password, session_file)
     print(f"[+] Logged in as @{cl.username}")
@@ -196,30 +261,7 @@ def _add_account():
         return
 
     # ── Proxy assignment ──────────────────────────────────────────────────
-    proxy = None
-    use_proxy = input("\nUse a proxy for this account? (y/n): ").strip().lower()
-
-    if use_proxy == "y":
-        pool       = cfg_data.get("proxy_pool", [])
-        auto_proxy = _next_unassigned_proxy(cfg_data)
-
-        if auto_proxy:
-            # Pool has a free proxy — auto-assign it, no need to prompt
-            proxy = auto_proxy
-            print(f"[+] Auto-assigned proxy from pool: {proxy}")
-        else:
-            # No free proxy — ask for a new one
-            if pool:
-                print("[!] All proxies in pool are already in use by other accounts.")
-            new_proxy = input("Enter proxy URL (http://user:pass@host:port): ").strip()
-            if new_proxy:
-                proxy = new_proxy
-                cfg_data["proxy_pool"].append(proxy)
-                print(f"[+] Added to pool and assigned: {proxy}")
-            else:
-                print("[!] No proxy entered — continuing without proxy.")
-    else:
-        print("[*] Skipping proxy — account will connect directly.")
+    proxy = _pick_proxy_interactive(cfg_data)
 
     session_file = f"{SESSIONS_DIR}/{username}_session.json"
     device_file  = f"{SESSIONS_DIR}/{username}_device.json"
@@ -370,6 +412,92 @@ def _test_login():
         print(f"[!] Login failed: {e}")
 
 
+def _import_from_cookies():
+    """Import an account using its sessionid cookie — skips password login entirely.
+    Best used when the account's IP is flagged and fresh logins fail."""
+    cfg_data = _load_accounts_file()
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+    print("\n── Import Account via Cookies ──")
+    print("How to get sessionid:")
+    print("  1. Log into Instagram on desktop (home IP, Chrome/Firefox).")
+    print("  2. Install 'Cookie-Editor' extension.")
+    print("  3. Open instagram.com → click the extension → find 'sessionid'.")
+    print("  4. Copy the VALUE (long string) and paste below.\n")
+
+    username = input("Instagram username: ").strip().lower()
+    if not username:
+        print("[!] Username required.")
+        return
+
+    if username in cfg_data["accounts"]:
+        ow = input(f"[!] @{username} already exists. Replace session? (y/n): ").strip().lower()
+        if ow != "y":
+            print("[!] Cancelled.")
+            return
+
+    sessionid = input("Paste sessionid value: ").strip()
+    if not sessionid:
+        print("[!] sessionid cannot be empty.")
+        return
+
+    # Some users paste the whole "sessionid=..." pair — strip prefix if present
+    if sessionid.lower().startswith("sessionid="):
+        sessionid = sessionid.split("=", 1)[1].strip().strip('"').strip("'")
+
+    proxy = _pick_proxy_interactive(cfg_data)
+
+    session_file = f"{SESSIONS_DIR}/{username}_session.json"
+    device_file  = f"{SESSIONS_DIR}/{username}_device.json"
+
+    # Reuse existing device fingerprint if present (don't trigger IG "new device" alert)
+    if os.path.exists(device_file):
+        print(f"[*] Reusing existing device fingerprint for @{username}.")
+    else:
+        print(f"[*] Generating device fingerprint for @{username}...")
+        device_data = _generate_device_fingerprint()
+        _save_device(device_data, device_file)
+        dev = device_data["device_settings"]
+        print(f"[+] Device: {dev['manufacturer']} {dev['model']} (Android {dev['android_release']})")
+
+    if proxy:
+        print(f"[*] Using proxy: {proxy}")
+    else:
+        print("[*] No proxy — connecting directly.")
+
+    print(f"[*] Logging in via sessionid...")
+    cl = Client(proxy=proxy)
+    cl.load_settings(device_file)
+
+    try:
+        cl.login_by_sessionid(sessionid)
+        # Verify the session actually works
+        _ = cl.user_id
+        cl.get_timeline_feed()
+        cl.dump_settings(session_file)
+        print(f"[✓] Logged in as @{cl.username} (ID: {cl.user_id})")
+    except Exception as e:
+        print(f"[!] Cookie login failed: {e}")
+        print("    Common causes: expired sessionid, proxy blocked, or account challenge.")
+        return
+
+    cfg_data["accounts"][username] = {
+        "password":     "",
+        "session_file": session_file,
+        "device_file":  device_file,
+        "proxy":        proxy,
+        "added_at":     str(date.today()),
+        "auth_method":  "cookie",
+    }
+
+    if not cfg_data.get("default"):
+        cfg_data["default"] = username
+        print(f"[+] Set @{username} as default account.")
+
+    _save_accounts_file(cfg_data)
+    print(f"[✓] @{username} saved (cookie auth).")
+
+
 def _manage_proxies():
     cfg_data = _load_accounts_file()
     pool     = cfg_data.get("proxy_pool", [])
@@ -481,7 +609,8 @@ def _main_menu():
         print("  4. Test login")
         print("  5. Set default account")
         print("  6. Manage proxies")
-        print("  7. Exit")
+        print("  7. Import account via cookies (sessionid)")
+        print("  8. Exit")
 
         choice = input("\nChoice: ").strip()
         if choice == "1":
@@ -497,6 +626,8 @@ def _main_menu():
         elif choice == "6":
             _manage_proxies()
         elif choice == "7":
+            _import_from_cookies()
+        elif choice == "8":
             break
         else:
             print("[!] Invalid choice.")
