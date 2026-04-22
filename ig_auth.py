@@ -276,11 +276,21 @@ def _add_account():
     session_file = f"{SESSIONS_DIR}/{username}_session.json"
     device_file  = f"{SESSIONS_DIR}/{username}_device.json"
 
-    print(f"\n[*] Generating unique device fingerprint for @{username}...")
-    device_data = _generate_device_fingerprint()
-    _save_device(device_data, device_file)
-    dev = device_data["device_settings"]
-    print(f"[+] Device: {dev['manufacturer']} {dev['model']} (Android {dev['android_release']})")
+    # IMPORTANT: reuse existing device fingerprint on retries. Generating a new
+    # device for every login attempt makes IG see "account logging in from 10
+    # different phones" — instant flag.
+    if os.path.exists(device_file):
+        with open(device_file) as f:
+            device_data = json.load(f)
+        dev = device_data["device_settings"]
+        print(f"\n[*] Reusing existing device fingerprint for @{username}.")
+        print(f"    Device: {dev['manufacturer']} {dev['model']} (Android {dev['android_release']})")
+    else:
+        print(f"\n[*] Generating unique device fingerprint for @{username}...")
+        device_data = _generate_device_fingerprint()
+        _save_device(device_data, device_file)
+        dev = device_data["device_settings"]
+        print(f"[+] Device: {dev['manufacturer']} {dev['model']} (Android {dev['android_release']})")
 
     if proxy:
         print(f"[*] Using proxy: {proxy}")
@@ -302,7 +312,7 @@ def _add_account():
 
     except Exception as e:
         print(f"[!] Login failed: {e}")
-        os.remove(device_file)
+        # Keep the device file — next retry should reuse the same fingerprint
         return
 
     cfg_data["accounts"][username] = {
