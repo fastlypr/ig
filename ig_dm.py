@@ -637,18 +637,33 @@ def main():
             for idx, (start_time, size) in enumerate(batches, 1):
                 print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
 
-            # Offer to start first batch immediately (interactive mode only)
-            if not args.auto and batches and (batches[0][0] - datetime.now()).total_seconds() > 600:
+            # Start first batch promptly:
+            # - Interactive mode: ask if >10 min away
+            # - Auto mode (systemd): always shift first batch to ~1-3 min from now,
+            #   preserving spacing between batches
+            if batches and (batches[0][0] - datetime.now()).total_seconds() > 600:
                 first_delay_min = int((batches[0][0] - datetime.now()).total_seconds() // 60)
-                print(f"\n[*] First batch is {first_delay_min} min away.")
-                start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()
-                if start_now == "y":
+
+                if args.auto:
+                    # Automatic: always pull the schedule forward
                     now   = datetime.now()
-                    shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0][0]
+                    shift = (now + timedelta(seconds=random.randint(60, 180))) - batches[0][0]
                     batches = [(t + shift, s) for t, s in batches]
+                    print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifting schedule to start now.")
                     print("\n── Updated Batch Plan ──")
                     for idx, (start_time, size) in enumerate(batches, 1):
                         print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
+                else:
+                    # Interactive: ask the user
+                    print(f"\n[*] First batch is {first_delay_min} min away.")
+                    start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()
+                    if start_now == "y":
+                        now   = datetime.now()
+                        shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0][0]
+                        batches = [(t + shift, s) for t, s in batches]
+                        print("\n── Updated Batch Plan ──")
+                        for idx, (start_time, size) in enumerate(batches, 1):
+                            print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
             print()
 
             # Execute batches
