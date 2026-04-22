@@ -39,10 +39,9 @@ WARMUP_MAX        = 30   # hard cap per day
 WARMUP_GROWTH_MIN = 1    # min increase per day
 WARMUP_GROWTH_MAX = 2    # max increase per day
 
-# Delay between DMs (seconds)
-DELAY_MIN    = 180   # 3 min
-DELAY_MAX    = 300   # 5 min
-DELAY_JITTER = 15    # ±15 sec jitter
+# Delay between DMs — scales with warmup day. See get_delay_range() below.
+# Floor is 3-6 min (180s–360s); early warmup days use 5-8 min to stay extra safe.
+DELAY_JITTER = 15    # ±15 sec jitter on every delay
 
 # Rate limit pause
 RATE_LIMIT_PAUSE_MIN = 900    # 15 min
@@ -299,10 +298,32 @@ def send_dm(cl, username, message):
         return user_id, False, str(e)
 
 
-def human_delay():
-    base  = random.randint(DELAY_MIN, DELAY_MAX)
+def get_delay_range(warmup_day):
+    """DM-to-DM delay (seconds) scaled by warmup day.
+    Slower early, then steady floor of 3-6 min once account is trusted."""
+    if warmup_day <= 3:
+        return (300, 480)   # 5-8 min — fresh account, maximum caution
+    if warmup_day <= 7:
+        return (240, 420)   # 4-7 min — early trust building
+    return (180, 360)       # 3-6 min — floor, kept forever
+
+
+def get_batch_gap_range(warmup_day):
+    """Gap between batches (seconds) scaled by warmup day."""
+    if warmup_day <= 3:
+        return (2 * 3600, 4 * 3600)   # 2-4 h
+    if warmup_day <= 7:
+        return (90 * 60, 2 * 3600)    # 1.5-2 h
+    if warmup_day <= 14:
+        return (60 * 60, 90 * 60)     # 1-1.5 h
+    return (45 * 60, 90 * 60)         # 45-90 min
+
+
+def human_delay(warmup_day=1):
+    dmin, dmax = get_delay_range(warmup_day)
+    base  = random.randint(dmin, dmax)
     total = max(60, base + random.randint(-DELAY_JITTER, DELAY_JITTER))
-    print(f"  [delay] Waiting {total // 60}m {total % 60}s before next DM...")
+    print(f"  [delay] Waiting {total // 60}m {total % 60}s before next DM (Day {warmup_day})...")
     time.sleep(total)
 
 
@@ -314,23 +335,32 @@ def rate_limit_pause():
 
 # ── Batch Scheduler ───────────────────────────────────────────────────────────
 
-def plan_batches(total_limit, start_from=None):
+def plan_batches(total_limit, start_from=None, warmup_day=1):
     """
     Split today's DM limit into randomized batches spread across the active
     window. Returns a list of (start_datetime, batch_size) tuples.
+
+    Batch count / sizing scales with warmup day:
+      Day 1-3:  1-2 batches, 1-3 DMs each (maximum caution)
+      Day 4-7:  2-3 batches, 3-4 DMs each
+      Day 8-14: 3-4 batches, 4-5 DMs each
+      Day 15+:  4-6 batches, 5-6 DMs each (full speed)
     """
     if total_limit <= 0:
         return []
 
-    # Batch count scales with size
-    if total_limit <= 4:
-        batch_count = 1
-    elif total_limit <= 10:
-        batch_count = random.randint(2, 3)
-    elif total_limit <= 20:
+    # Batch count scales with both size AND warmup day
+    if warmup_day <= 3:
+        batch_count = 1 if total_limit <= 3 else 2
+    elif warmup_day <= 7:
+        batch_count = random.randint(2, 3) if total_limit <= 10 else 3
+    elif warmup_day <= 14:
         batch_count = random.randint(3, 4)
     else:
         batch_count = random.randint(4, 6)
+
+    # Never have more batches than DMs to send
+    batch_count = min(batch_count, total_limit)
 
     # Split total into that many random-sized pieces
     sizes = [0] * batch_count
@@ -445,13 +475,16 @@ def send_one_dm(pending, templates, accounts, warmup_states, clients, acc_index)
 
 
 def run_batch(batch_size, pending, templates, accounts, warmup_states, clients, acc_index):
-    """Send a batch of DMs with 3-5 min gaps between each."""
+    """Send a batch of DMs with warmup-day-scaled gaps between each."""
     sent_in_batch = 0
     failed_in_batch = 0
 
     for i in range(batch_size):
         if not pending:
             break
+
+        # Capture the account that WILL send the next DM (before send_one_dm rotates)
+        sending_acc = accounts[acc_index % len(accounts)]
 
         acc_index, status = send_one_dm(
             pending, templates, accounts, warmup_states, clients, acc_index
@@ -469,7 +502,9 @@ def run_batch(batch_size, pending, templates, accounts, warmup_states, clients, 
 
         # Gap between DMs within a batch (skip after the last one)
         if i < batch_size - 1 and pending:
-            human_delay()
+            # Use sending account's warmup day to set delay length
+            day = warmup_states.get(sending_acc, {}).get("day", 1)
+            human_delay(warmup_day=day)
 
     return acc_index, sent_in_batch, failed_in_batch
 
@@ -631,8 +666,10 @@ def main():
         if total_remaining == 0:
             print("[!] All accounts already at daily limit. Sleeping until tomorrow.\n")
         else:
-            # Plan batches for today
-            batches = plan_batches(total_remaining)
+            # Use the MIN warmup day across accounts — we pace the whole day
+            # to the slowest/newest account's trust level for safety.
+            min_day = min(ws.get("day", 1) for ws in warmup_states.values())
+            batches = plan_batches(total_remaining, warmup_day=min_day)
             print(f"── Today's Batch Plan ({len(batches)} batches) ──")
             for idx, (start_time, size) in enumerate(batches, 1):
                 print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
