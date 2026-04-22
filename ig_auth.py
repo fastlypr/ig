@@ -508,6 +508,116 @@ def _import_from_cookies():
     print(f"[✓] @{username} saved (cookie auth).")
 
 
+def _import_from_email_link():
+    """Import an account using the 'Log in as X' email link from IG's password-reset email.
+    Hits the URL through the chosen proxy, captures the sessionid cookie IG sets,
+    and feeds it to instagrapi. Link expires in ~30 min and is single-use."""
+    import requests
+
+    cfg_data = _load_accounts_file()
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+    print("\n── Import Account via Email Login Link ──")
+    print("How to get the link:")
+    print("  1. Go to https://www.instagram.com/accounts/password/reset/")
+    print("  2. Enter the username/email → submit")
+    print("  3. Open email: 'we've made it easy to get back on Instagram'")
+    print("  4. Right-click the blue 'Log in as <username>' button → Copy Link")
+    print("  5. Paste below (full URL, starts with https://www.instagram.com/_n/web_emaillogin...)")
+    print("  Note: link expires in ~30 min and is SINGLE-USE.\n")
+
+    username = input("Instagram username: ").strip().lower()
+    if not username:
+        print("[!] Username required.")
+        return
+
+    if username in cfg_data["accounts"]:
+        ow = input(f"[!] @{username} already exists. Replace session? (y/n): ").strip().lower()
+        if ow != "y":
+            print("[!] Cancelled.")
+            return
+
+    link = input("Paste the 'Log in as ...' URL: ").strip()
+    if "instagram.com" not in link or "token=" not in link:
+        print("[!] That doesn't look like a valid IG email-login link.")
+        return
+
+    proxy = _pick_proxy_interactive(cfg_data)
+
+    session_file = f"{SESSIONS_DIR}/{username}_session.json"
+    device_file  = f"{SESSIONS_DIR}/{username}_device.json"
+
+    if os.path.exists(device_file):
+        print(f"[*] Reusing existing device fingerprint for @{username}.")
+    else:
+        print(f"[*] Generating device fingerprint for @{username}...")
+        device_data = _generate_device_fingerprint()
+        _save_device(device_data, device_file)
+        dev = device_data["device_settings"]
+        print(f"[+] Device: {dev['manufacturer']} {dev['model']} (Android {dev['android_release']})")
+
+    # ── Visit the email link through the chosen proxy to capture sessionid ──
+    sess = requests.Session()
+    if proxy:
+        sess.proxies = {"http": proxy, "https": proxy}
+    sess.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/122.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+    })
+
+    print(f"[*] Opening link via {'proxy: ' + proxy if proxy else 'direct connection'}...")
+    try:
+        r = sess.get(link, allow_redirects=True, timeout=45)
+    except Exception as e:
+        print(f"[!] Request failed: {e}")
+        print("    If this is a SOCKS5 proxy, ensure pysocks is installed:")
+        print("      pip install 'requests[socks]' pysocks")
+        return
+
+    sessionid = sess.cookies.get("sessionid", domain=".instagram.com") or sess.cookies.get("sessionid")
+    if not sessionid:
+        print(f"[!] No sessionid returned (HTTP {r.status_code}, final URL: {r.url}).")
+        print("    The link may have expired, been used, or the proxy was blocked by IG.")
+        return
+
+    print(f"[+] Captured sessionid: {sessionid[:25]}...")
+
+    # ── Hand the sessionid to instagrapi ──
+    print(f"[*] Verifying session with instagrapi...")
+    cl = Client(proxy=proxy)
+    cl.load_settings(device_file)
+
+    try:
+        cl.login_by_sessionid(sessionid)
+        _ = cl.user_id
+        cl.get_timeline_feed()
+        cl.dump_settings(session_file)
+        print(f"[✓] Logged in as @{cl.username} (ID: {cl.user_id})")
+    except Exception as e:
+        print(f"[!] login_by_sessionid failed: {e}")
+        print("    The cookie was captured but IG rejected it for the mobile API.")
+        return
+
+    cfg_data["accounts"][username] = {
+        "password":     "",
+        "session_file": session_file,
+        "device_file":  device_file,
+        "proxy":        proxy,
+        "added_at":     str(date.today()),
+        "auth_method":  "cookie",
+    }
+    if not cfg_data.get("default"):
+        cfg_data["default"] = username
+        print(f"[+] Set @{username} as default account.")
+
+    _save_accounts_file(cfg_data)
+    print(f"[✓] @{username} saved (email-link auth).")
+
+
 def _manage_proxies():
     cfg_data = _load_accounts_file()
     pool     = cfg_data.get("proxy_pool", [])
@@ -620,7 +730,8 @@ def _main_menu():
         print("  5. Set default account")
         print("  6. Manage proxies")
         print("  7. Import account via cookies (sessionid)")
-        print("  8. Exit")
+        print("  8. Import account via email login link")
+        print("  9. Exit")
 
         choice = input("\nChoice: ").strip()
         if choice == "1":
@@ -638,6 +749,8 @@ def _main_menu():
         elif choice == "7":
             _import_from_cookies()
         elif choice == "8":
+            _import_from_email_link()
+        elif choice == "9":
             break
         else:
             print("[!] Invalid choice.")
