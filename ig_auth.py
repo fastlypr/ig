@@ -143,7 +143,7 @@ def _pick_proxy_interactive(cfg_data):
     pool  = cfg_data.get("proxy_pool", [])
     usage = _proxy_usage(cfg_data)
 
-    if pool:
+    while pool:
         print("\n── Available proxies ──")
         for idx, p in enumerate(pool, 1):
             accs = usage.get(p, [])
@@ -152,7 +152,7 @@ def _pick_proxy_interactive(cfg_data):
         print(f"  {len(pool)+1}. Add a new proxy")
         print(f"  0. Skip (no proxy)")
 
-        choice = input("Choice: ").strip()
+        choice = input("Choice (number): ").strip()
         if choice == "0":
             return None
         if choice.isdigit() and 1 <= int(choice) <= len(pool):
@@ -165,8 +165,18 @@ def _pick_proxy_interactive(cfg_data):
                 cfg_data["proxy_pool"].append(new_proxy)
                 print(f"[+] Added and assigned: {new_proxy}")
                 return new_proxy
-        print("[!] Invalid choice — continuing without proxy.")
-        return None
+            print("[!] Empty URL.")
+            continue
+        # Detected a pasted URL where a number was expected — offer to add it
+        if "://" in choice or "@" in choice:
+            add = input(f"[?] That looks like a proxy URL, not a number. Add '{choice}' to the pool and use it? (y/n): ").strip().lower()
+            if add == "y":
+                cfg_data["proxy_pool"].append(choice)
+                print(f"[+] Added and assigned: {choice}")
+                return choice
+            continue
+        print("[!] Invalid choice. Enter a number from the list above.")
+        # Loop back
 
     new_proxy = input("Enter proxy URL (http://user:pass@host:port or socks5h://...): ").strip()
     if new_proxy:
