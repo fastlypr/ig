@@ -988,30 +988,50 @@ def main():
                 planned = plan_batches(total_remaining, warmup_day=min_day, proxy_tz=proxy_tz)
                 batches = [{"start": t, "size": s, "done": 0} for t, s in planned]
 
-                # Auto-shift first batch if far away
+                # Auto-shift first batch if far away — but ONLY when proxy-local
+                # time is already inside active hours. If proxy is asleep (dead
+                # zone or after 22:00), honor the planned wait.
                 if batches and (batches[0]["start"] - datetime.now()).total_seconds() > 600:
                     first_delay_min = int((batches[0]["start"] - datetime.now()).total_seconds() // 60)
+                    now_proxy = datetime.now(proxy_tz)
+                    in_active = DEAD_ZONE[1] <= now_proxy.hour < 22
+
                     if args.auto:
-                        now   = datetime.now()
-                        shift = (now + timedelta(seconds=random.randint(60, 180))) - batches[0]["start"]
-                        for b in batches:
-                            b["start"] = b["start"] + shift
-                        print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifting schedule to start now.")
-                    else:
-                        print(f"\n[*] First batch is {first_delay_min} min away.")
-                        start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()
-                        if start_now == "y":
+                        if in_active:
                             now   = datetime.now()
-                            shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0]["start"]
+                            shift = (now + timedelta(seconds=random.randint(60, 180))) - batches[0]["start"]
                             for b in batches:
                                 b["start"] = b["start"] + shift
+                            print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifting to start now "
+                                  f"(proxy-local {now_proxy.strftime('%H:%M')} is inside active hours).")
+                        else:
+                            reason = "dead zone" if now_proxy.hour < DEAD_ZONE[1] else "past active window"
+                            print(f"\n[*] Auto mode: first batch is {first_delay_min} min away — NOT shifting "
+                                  f"(proxy-local {now_proxy.strftime('%H:%M')} is in {reason}).")
+                    else:
+                        print(f"\n[*] First batch is {first_delay_min} min away. "
+                              f"Proxy-local time: {now_proxy.strftime('%H:%M')} "
+                              f"({'active' if in_active else 'asleep'}).")
+                        if in_active:
+                            start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()
+                            if start_now == "y":
+                                now   = datetime.now()
+                                shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0]["start"]
+                                for b in batches:
+                                    b["start"] = b["start"] + shift
                 save_batch_plan(batches)
 
             print(f"── Today's Batch Plan ({len(batches)} batches) ──")
             for idx, b in enumerate(batches, 1):
                 remaining = b["size"] - b["done"]
-                print(f"  Batch {idx}: {remaining} DMs at {b['start'].strftime('%H:%M')}"
-                      + (f" (done {b['done']}/{b['size']})" if b["done"] else ""))
+                # Show both system time and proxy-local time for clarity
+                start_aware = b["start"].astimezone() if b["start"].tzinfo else \
+                              b["start"].replace(tzinfo=datetime.now().astimezone().tzinfo)
+                proxy_local = start_aware.astimezone(proxy_tz)
+                print(f"  Batch {idx}: {remaining} DMs at "
+                      f"{b['start'].strftime('%a %H:%M')} (server) / "
+                      f"{proxy_local.strftime('%a %H:%M')} ({tz_label.split()[0]})"
+                      + (f"  [done {b['done']}/{b['size']}]" if b["done"] else ""))
             print()
 
             # Execute batches
