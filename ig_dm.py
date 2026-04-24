@@ -10,6 +10,7 @@ Setup:
 """
 
 import os
+import re
 import csv
 import json
 import time
@@ -18,6 +19,10 @@ import requests
 import io
 import argparse
 from datetime import date, datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # fallback
 from instagrapi.exceptions import (
     ClientThrottledError, RateLimitError,
     UserNotFound, DirectError, LoginRequired,
@@ -48,12 +53,145 @@ RATE_LIMIT_PAUSE_MIN = 900    # 15 min
 RATE_LIMIT_PAUSE_MAX = 1800   # 30 min
 
 # Active hours (24h format) — DMs only sent inside this window
-ACTIVE_START_HOUR = 9    # 9 AM
-ACTIVE_END_HOUR   = 22   # 10 PM
+# Interpreted in the proxy's local timezone, not the server's.
+ACTIVE_START_HOUR = 9    # 9 AM (weekday); weekend shifted +1
+ACTIVE_END_HOUR   = 22   # 10 PM (weekday); weekend shifted +1
+DEAD_ZONE         = (0, 7)   # hours local — never send
+
+# Weighted time windows (start_hour, end_hour, weight). Weights must sum ≈ 1.
+WEEKDAY_WINDOWS = [
+    (9,  11, 0.20),   # morning coffee scroll
+    (12, 14, 0.15),   # lunch break
+    (14, 18, 0.15),   # afternoon filler
+    (18, 22, 0.50),   # evening peak
+]
+WEEKEND_WINDOWS = [
+    (10, 12, 0.15),   # slow morning
+    (12, 15, 0.15),   # midday
+    (15, 19, 0.20),   # afternoon
+    (19, 23, 0.50),   # big evening
+]
+
+DEFAULT_TZ = "Asia/Kolkata"   # fallback when proxy country can't be resolved
 
 # Batch scheduling (spreads daily DMs across the day)
 BATCH_SIZE_MIN = 2     # min DMs per batch
 BATCH_SIZE_MAX = 6     # max DMs per batch
+
+
+# ── Proxy → Timezone ──────────────────────────────────────────────────────────
+
+COUNTRY_TZ = {
+    "us": "America/New_York",    "ua": "Europe/Kyiv",
+    "gb": "Europe/London",       "uk": "Europe/London",
+    "de": "Europe/Berlin",       "fr": "Europe/Paris",
+    "in": "Asia/Kolkata",        "br": "America/Sao_Paulo",
+    "ca": "America/Toronto",     "au": "Australia/Sydney",
+    "jp": "Asia/Tokyo",          "ae": "Asia/Dubai",
+    "sg": "Asia/Singapore",      "es": "Europe/Madrid",
+    "it": "Europe/Rome",         "nl": "Europe/Amsterdam",
+    "pl": "Europe/Warsaw",       "se": "Europe/Stockholm",
+    "mx": "America/Mexico_City", "id": "Asia/Jakarta",
+    "tr": "Europe/Istanbul",     "ru": "Europe/Moscow",
+    "kr": "Asia/Seoul",          "th": "Asia/Bangkok",
+    "vn": "Asia/Ho_Chi_Minh",    "ph": "Asia/Manila",
+    "za": "Africa/Johannesburg", "ar": "America/Argentina/Buenos_Aires",
+    "cl": "America/Santiago",    "co": "America/Bogota",
+    "pe": "America/Lima",        "pk": "Asia/Karachi",
+    "bd": "Asia/Dhaka",          "eg": "Africa/Cairo",
+    "ng": "Africa/Lagos",        "ke": "Africa/Nairobi",
+    "il": "Asia/Jerusalem",      "sa": "Asia/Riyadh",
+    "my": "Asia/Kuala_Lumpur",   "ie": "Europe/Dublin",
+    "ch": "Europe/Zurich",       "at": "Europe/Vienna",
+    "be": "Europe/Brussels",     "pt": "Europe/Lisbon",
+    "gr": "Europe/Athens",       "no": "Europe/Oslo",
+    "dk": "Europe/Copenhagen",   "fi": "Europe/Helsinki",
+    "ro": "Europe/Bucharest",    "cz": "Europe/Prague",
+    "hu": "Europe/Budapest",     "bg": "Europe/Sofia",
+    "hk": "Asia/Hong_Kong",      "tw": "Asia/Taipei",
+    "nz": "Pacific/Auckland",
+}
+
+US_STATE_TZ = {
+    "california":"America/Los_Angeles", "ca":"America/Los_Angeles",
+    "oregon":"America/Los_Angeles",     "washington":"America/Los_Angeles",
+    "nevada":"America/Los_Angeles",
+    "arizona":"America/Phoenix",
+    "colorado":"America/Denver", "utah":"America/Denver",
+    "newmexico":"America/Denver", "montana":"America/Denver",
+    "wyoming":"America/Denver",  "idaho":"America/Denver",
+    "texas":"America/Chicago",        "illinois":"America/Chicago",
+    "minnesota":"America/Chicago",    "missouri":"America/Chicago",
+    "louisiana":"America/Chicago",    "oklahoma":"America/Chicago",
+    "arkansas":"America/Chicago",     "kansas":"America/Chicago",
+    "iowa":"America/Chicago",         "wisconsin":"America/Chicago",
+    "alabama":"America/Chicago",      "mississippi":"America/Chicago",
+    "tennessee":"America/Chicago",    "nebraska":"America/Chicago",
+    "newyork":"America/New_York",  "ny":"America/New_York",
+    "florida":"America/New_York",  "fl":"America/New_York",
+    "georgia":"America/New_York",  "pennsylvania":"America/New_York",
+    "ohio":"America/New_York",     "michigan":"America/New_York",
+    "virginia":"America/New_York", "northcarolina":"America/New_York",
+    "newjersey":"America/New_York","massachusetts":"America/New_York",
+    "maryland":"America/New_York", "indiana":"America/New_York",
+    "alaska":"America/Anchorage",
+    "hawaii":"Pacific/Honolulu",
+}
+
+
+def parse_proxy_country(proxy):
+    """Extract (country_code, state) from a proxy URL. Returns (None, None) if not found."""
+    if not proxy:
+        return None, None
+    p = proxy.lower()
+    country = None
+    state   = None
+    # Decodo/Smartproxy style: country-us, country.us
+    m = re.search(r'country[-.]([a-z]{2})\b', p)
+    if m: country = m.group(1)
+    # DataImpulse style: cr.us, __cr.us
+    if not country:
+        m = re.search(r'(?:^|[^a-z])cr\.([a-z]{2})\b', p)
+        if m: country = m.group(1)
+    # Generic _cc-XX / _cc.XX
+    if not country:
+        m = re.search(r'[_-]cc[-.]([a-z]{2})\b', p)
+        if m: country = m.group(1)
+    # region-XX / zone-XX (less common)
+    if not country:
+        m = re.search(r'(?:region|zone)[-.]([a-z]{2})\b', p)
+        if m: country = m.group(1)
+
+    # State / region
+    m = re.search(r'state[-.]([a-z_]+)', p)
+    if m: state = m.group(1)
+    if not state:
+        m = re.search(r'region[-.]([a-z_]+)', p)
+        # avoid re-matching the country code with "region.us"
+        if m and len(m.group(1)) > 2:
+            state = m.group(1)
+    return country, state
+
+
+def resolve_proxy_tz(proxy, default=DEFAULT_TZ):
+    """
+    Return (ZoneInfo, human_label) for a proxy URL.
+    Falls back to DEFAULT_TZ if country can't be detected.
+    """
+    country, state = parse_proxy_country(proxy)
+    if country == "us" and state:
+        key = state.replace("_", "").replace("-", "")
+        tz = US_STATE_TZ.get(key)
+        if tz:
+            return ZoneInfo(tz), f"US/{state} ({tz})"
+    if country:
+        tz = COUNTRY_TZ.get(country)
+        if tz:
+            return ZoneInfo(tz), f"{country.upper()} ({tz})"
+    try:
+        return ZoneInfo(default), f"default ({default})"
+    except Exception:
+        return ZoneInfo("UTC"), "UTC"
 
 
 # ── Google Sheets (no API, direct CSV export) ─────────────────────────────────
@@ -335,21 +473,29 @@ def rate_limit_pause():
 
 # ── Batch Scheduler ───────────────────────────────────────────────────────────
 
-def plan_batches(total_limit, start_from=None, warmup_day=1):
-    """
-    Split today's DM limit into randomized batches spread across the active
-    window. Returns a list of (start_datetime, batch_size) tuples.
+def _windows_for_date(d):
+    """Return the weighted time windows for a given date (weekday vs weekend)."""
+    return WEEKEND_WINDOWS if d.weekday() >= 5 else WEEKDAY_WINDOWS
 
-    Batch count / sizing scales with warmup day:
-      Day 1-3:  1-2 batches, 1-3 DMs each (maximum caution)
-      Day 4-7:  2-3 batches, 3-4 DMs each
-      Day 8-14: 3-4 batches, 4-5 DMs each
-      Day 15+:  4-6 batches, 5-6 DMs each (full speed)
+
+def plan_batches(total_limit, start_from=None, warmup_day=1, proxy_tz=None):
+    """
+    Split today's DM budget into randomized batches, weighted by real human
+    activity patterns, in the proxy's local timezone.
+
+    Weights (weekday):
+      20% morning (9-11), 15% midday (12-14),
+      15% afternoon (14-18), 50% evening (18-22)
+    Dead zone (00:00-07:00 local) → pushed to next morning.
+
+    Batch count scales with warmup day (Day 1-3: 1-2, ..., Day 15+: 4-6).
+    Returns list of (start_datetime, batch_size) — datetimes are NAIVE in
+    the server's local time (compatible with datetime.now() elsewhere).
     """
     if total_limit <= 0:
         return []
 
-    # Batch count scales with both size AND warmup day
+    # Batch count scales with warmup day
     if warmup_day <= 3:
         batch_count = 1 if total_limit <= 3 else 2
     elif warmup_day <= 7:
@@ -358,47 +504,89 @@ def plan_batches(total_limit, start_from=None, warmup_day=1):
         batch_count = random.randint(3, 4)
     else:
         batch_count = random.randint(4, 6)
-
-    # Never have more batches than DMs to send
     batch_count = min(batch_count, total_limit)
 
-    # Split total into that many random-sized pieces
+    # Split total DMs into batches
     sizes = [0] * batch_count
     for _ in range(total_limit):
         sizes[random.randint(0, batch_count - 1)] += 1
-    sizes = [s for s in sizes if s > 0]  # drop empties
-    batch_count = len(sizes)
+    sizes = [s for s in sizes if s > 0]
 
-    # Active window for today (or tomorrow if we're already past it)
-    now = start_from or datetime.now()
-    today_start = now.replace(hour=ACTIVE_START_HOUR, minute=0, second=0, microsecond=0)
-    today_end   = now.replace(hour=ACTIVE_END_HOUR,   minute=0, second=0, microsecond=0)
+    # Timezone setup
+    if proxy_tz is None:
+        proxy_tz = ZoneInfo(DEFAULT_TZ)
 
-    if now >= today_end:
-        # Past active window — schedule for tomorrow
-        today_start += timedelta(days=1)
-        today_end   += timedelta(days=1)
-    elif now > today_start:
-        # Mid-day start — use now as window start
-        today_start = now + timedelta(seconds=random.randint(30, 180))
+    now_local = datetime.now(proxy_tz) if start_from is None else start_from.astimezone(proxy_tz)
 
-    window_seconds = int((today_end - today_start).total_seconds())
-    if window_seconds < 60:
-        # No room left today — push to tomorrow
-        today_start = (today_start + timedelta(days=1)).replace(hour=ACTIVE_START_HOUR, minute=0, second=0, microsecond=0)
-        today_end   = today_start.replace(hour=ACTIVE_END_HOUR)
-        window_seconds = int((today_end - today_start).total_seconds())
+    # Pacing parameters
+    gap_min, gap_max     = get_batch_gap_range(warmup_day)
+    delay_min, delay_max = get_delay_range(warmup_day)
 
-    # Divide window into equal segments, pick a random time within each segment
-    segment = window_seconds // batch_count
-    batch_plan = []
-    for i, size in enumerate(sizes):
-        seg_start = i * segment
-        seg_end   = max(seg_start + 1, (i + 1) * segment)
-        offset    = random.randint(seg_start, seg_end - 1)
-        batch_plan.append((today_start + timedelta(seconds=offset), size))
+    # Earliest slot: now + small warm-up delay, bumped out of dead zone / past-evening
+    earliest = now_local + timedelta(minutes=random.randint(3, 15))
+    if earliest.hour < DEAD_ZONE[1] or earliest.hour >= 22:
+        # Advance to next morning's first window start, with ±30 min jitter
+        next_day = earliest.date()
+        if earliest.hour >= 22:
+            next_day = next_day + timedelta(days=1)
+        first_ws = _windows_for_date(next_day)[0][0]
+        earliest = datetime(
+            next_day.year, next_day.month, next_day.day,
+            first_ws, random.randint(0, 30),
+            tzinfo=proxy_tz,
+        )
 
-    return batch_plan
+    planned = []
+    i = 0
+    max_iterations = len(sizes) * 5  # safety against loops
+    while i < len(sizes) and max_iterations > 0:
+        max_iterations -= 1
+        size = sizes[i]
+        windows = _windows_for_date(earliest.date())
+
+        # Find windows on earliest.date() that still have room
+        day = earliest.date()
+        viable = []
+        viable_weights = []
+        for (ws, we, w) in windows:
+            win_end = datetime(day.year, day.month, day.day, we, 0, tzinfo=proxy_tz)
+            if win_end - earliest > timedelta(minutes=5):
+                viable.append((ws, we))
+                viable_weights.append(w)
+
+        if not viable:
+            # No room left today — jump to tomorrow's first window with jitter
+            tomorrow = day + timedelta(days=1)
+            first_ws = _windows_for_date(tomorrow)[0][0]
+            earliest = datetime(
+                tomorrow.year, tomorrow.month, tomorrow.day,
+                first_ws, random.randint(0, 30),
+                tzinfo=proxy_tz,
+            )
+            continue  # retry same batch
+
+        ws, we = random.choices(viable, weights=viable_weights)[0]
+        win_start = datetime(day.year, day.month, day.day, ws, 0, tzinfo=proxy_tz)
+        win_end   = datetime(day.year, day.month, day.day, we, 0, tzinfo=proxy_tz)
+        slot_start = max(win_start, earliest)
+
+        # Random placement inside the remaining window
+        range_secs = int((win_end - slot_start).total_seconds())
+        offset = random.randint(0, max(1, range_secs - 60))
+        slot = slot_start + timedelta(seconds=offset)
+        planned.append((slot, size))
+
+        # Advance earliest: batch sending time + rest gap
+        avg_delay      = (delay_min + delay_max) // 2
+        batch_duration = size * avg_delay
+        gap = random.randint(gap_min, gap_max)
+        earliest = slot + timedelta(seconds=batch_duration + gap)
+        i += 1
+
+    planned.sort(key=lambda x: x[0])
+
+    # Convert aware → naive system-local (keeps downstream wait_until() happy)
+    return [(dt.astimezone().replace(tzinfo=None), sz) for (dt, sz) in planned]
 
 
 BATCH_PLAN_FILE = os.path.join(SESSIONS_DIR, "batch_plan.json")
@@ -704,8 +892,18 @@ def main():
     grand_total   = 0
     grand_failed  = 0
 
+    # Resolve the schedule's timezone from the primary account's proxy.
+    # (All accounts in one run share a schedule; we use the first selected.)
+    primary_proxy = cfg_data.get("accounts", {}).get(accounts[0], {}).get("proxy")
+    proxy_tz, tz_label = resolve_proxy_tz(primary_proxy)
+    now_local = datetime.now(proxy_tz)
+
     print(f"\n[+] Using {len(accounts)} account(s): {', '.join('@'+a for a in accounts)}")
-    print(f"[+] Active hours: {ACTIVE_START_HOUR:02d}:00 – {ACTIVE_END_HOUR:02d}:00")
+    print(f"[+] Schedule clock: {tz_label}  —  currently {now_local.strftime('%a %H:%M')} local")
+    is_weekend = now_local.weekday() >= 5
+    active_windows = "weekend" if is_weekend else "weekday"
+    print(f"[+] Mode: {active_windows} — weighted windows (morning/midday/afternoon/evening)")
+    print(f"[+] Dead zone (never sends): {DEAD_ZONE[0]:02d}:00 – {DEAD_ZONE[1]:02d}:00 proxy-local")
     print(f"[+] Script will run all day and sleep between batches.\n")
 
     # ── Day loop ──────────────────────────────────────────────────────────
@@ -787,7 +985,7 @@ def main():
             if batches is None:
                 # Fresh plan
                 clear_batch_plan()
-                planned = plan_batches(total_remaining, warmup_day=min_day)
+                planned = plan_batches(total_remaining, warmup_day=min_day, proxy_tz=proxy_tz)
                 batches = [{"start": t, "size": s, "done": 0} for t, s in planned]
 
                 # Auto-shift first batch if far away
@@ -851,12 +1049,16 @@ def main():
             print("\n[✓] All done. Exiting.")
             break
 
-        tomorrow_start = (datetime.now() + timedelta(days=1)).replace(
-            hour=ACTIVE_START_HOUR,
-            minute=random.randint(0, 30),  # random start time to avoid pattern
-            second=random.randint(0, 59),
-            microsecond=0,
+        # Sleep until tomorrow's first window IN THE PROXY'S LOCAL TIME.
+        tomorrow_local = datetime.now(proxy_tz) + timedelta(days=1)
+        first_ws = _windows_for_date(tomorrow_local.date())[0][0]
+        tomorrow_aware = datetime(
+            tomorrow_local.year, tomorrow_local.month, tomorrow_local.day,
+            first_ws, random.randint(0, 30),
+            random.randint(0, 59),
+            tzinfo=proxy_tz,
         )
+        tomorrow_start = tomorrow_aware.astimezone().replace(tzinfo=None)
         print(f"\n── Today's DMs complete ──")
         print(f"   Grand total sent: {grand_total}")
         print(f"   Grand total failed: {grand_failed}")
