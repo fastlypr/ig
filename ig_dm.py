@@ -401,6 +401,100 @@ def plan_batches(total_limit, start_from=None, warmup_day=1):
     return batch_plan
 
 
+BATCH_PLAN_FILE = os.path.join(SESSIONS_DIR, "batch_plan.json")
+
+
+def save_batch_plan(batches):
+    """Persist batch plan so we can resume after restart.
+    batches = list of dicts {start: datetime, size: int, done: int}"""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    data = {
+        "saved_at": datetime.now().isoformat(),
+        "batches": [
+            {
+                "start": b["start"].isoformat() if isinstance(b["start"], datetime) else b["start"],
+                "size":  int(b["size"]),
+                "done":  int(b.get("done", 0)),
+            }
+            for b in batches
+        ],
+    }
+    with open(BATCH_PLAN_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_batch_plan():
+    if not os.path.exists(BATCH_PLAN_FILE):
+        return None
+    try:
+        with open(BATCH_PLAN_FILE) as f:
+            data = json.load(f)
+        return [
+            {
+                "start": datetime.fromisoformat(b["start"]),
+                "size":  int(b["size"]),
+                "done":  int(b.get("done", 0)),
+            }
+            for b in data.get("batches", [])
+        ]
+    except Exception as e:
+        print(f"[!] Could not read batch plan ({e}) — starting fresh.")
+        return None
+
+
+def clear_batch_plan():
+    if os.path.exists(BATCH_PLAN_FILE):
+        try:
+            os.remove(BATCH_PLAN_FILE)
+        except OSError:
+            pass
+
+
+def reconcile_plan(batches, stale_hours=12):
+    """
+    Adjust a saved plan for current time.
+
+    - Completed batches (done >= size) → dropped
+    - Past-due batches with work remaining → merged into ONE catch-up batch
+      scheduled 2-5 min from now
+    - Future batches → kept at original time, size = remaining work
+    - If the most recent batch is more than `stale_hours` old, the plan is
+      considered abandoned (e.g. VPS was down overnight) and we plan fresh
+
+    Returns new list of dicts, or None if plan is unusable.
+    """
+    if not batches:
+        return None
+
+    now    = datetime.now()
+    latest = max(b["start"] for b in batches)
+    if (now - latest).total_seconds() > stale_hours * 3600:
+        print(f"[resume] Saved plan is older than {stale_hours}h — discarding.")
+        return None
+
+    catchup_size = 0
+    future = []
+    for b in batches:
+        remaining = b["size"] - b["done"]
+        if remaining <= 0:
+            continue
+        if b["start"] <= now:
+            catchup_size += remaining
+        else:
+            future.append({"start": b["start"], "size": remaining, "done": 0})
+
+    result = []
+    if catchup_size > 0:
+        catchup_time = now + timedelta(seconds=random.randint(120, 300))
+        result.append({"start": catchup_time, "size": catchup_size, "done": 0})
+        print(f"[resume] {catchup_size} DM(s) were past-due — catch-up batch at {catchup_time.strftime('%H:%M')}")
+    if future:
+        print(f"[resume] {len(future)} future batch(es) preserved from previous plan")
+    result.extend(future)
+    result.sort(key=lambda b: b["start"])
+    return result or None
+
+
 def wait_until(target_time, label=""):
     """Sleep until target_time, with periodic status updates."""
     while True:
@@ -666,54 +760,78 @@ def main():
         if total_remaining == 0:
             print("[!] All accounts already at daily limit. Sleeping until tomorrow.\n")
         else:
-            # Use the MIN warmup day across accounts — we pace the whole day
-            # to the slowest/newest account's trust level for safety.
+            # ── Resume previous plan if one exists ─────────────────────────
             min_day = min(ws.get("day", 1) for ws in warmup_states.values())
-            batches = plan_batches(total_remaining, warmup_day=min_day)
-            print(f"── Today's Batch Plan ({len(batches)} batches) ──")
-            for idx, (start_time, size) in enumerate(batches, 1):
-                print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
+            batches = None
+            saved = load_batch_plan()
+            if saved:
+                reconciled = reconcile_plan(saved)
+                if reconciled:
+                    # Cap each batch size by remaining account capacity
+                    total_in_plan = sum(b["size"] for b in reconciled)
+                    if total_in_plan > total_remaining:
+                        print(f"[resume] Plan had {total_in_plan} DMs but only {total_remaining} capacity left — trimming.")
+                        # Trim from the tail
+                        excess = total_in_plan - total_remaining
+                        for b in reversed(reconciled):
+                            take = min(b["size"], excess)
+                            b["size"] -= take
+                            excess   -= take
+                            if excess <= 0:
+                                break
+                        reconciled = [b for b in reconciled if b["size"] > 0]
+                    if reconciled:
+                        batches = reconciled
+                        print(f"[resume] Resuming plan with {len(batches)} batch(es), {sum(b['size'] for b in batches)} DM(s).")
 
-            # Start first batch promptly:
-            # - Interactive mode: ask if >10 min away
-            # - Auto mode (systemd): always shift first batch to ~1-3 min from now,
-            #   preserving spacing between batches
-            if batches and (batches[0][0] - datetime.now()).total_seconds() > 600:
-                first_delay_min = int((batches[0][0] - datetime.now()).total_seconds() // 60)
+            if batches is None:
+                # Fresh plan
+                clear_batch_plan()
+                planned = plan_batches(total_remaining, warmup_day=min_day)
+                batches = [{"start": t, "size": s, "done": 0} for t, s in planned]
 
-                if args.auto:
-                    # Automatic: always pull the schedule forward
-                    now   = datetime.now()
-                    shift = (now + timedelta(seconds=random.randint(60, 180))) - batches[0][0]
-                    batches = [(t + shift, s) for t, s in batches]
-                    print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifting schedule to start now.")
-                    print("\n── Updated Batch Plan ──")
-                    for idx, (start_time, size) in enumerate(batches, 1):
-                        print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
-                else:
-                    # Interactive: ask the user
-                    print(f"\n[*] First batch is {first_delay_min} min away.")
-                    start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()
-                    if start_now == "y":
+                # Auto-shift first batch if far away
+                if batches and (batches[0]["start"] - datetime.now()).total_seconds() > 600:
+                    first_delay_min = int((batches[0]["start"] - datetime.now()).total_seconds() // 60)
+                    if args.auto:
                         now   = datetime.now()
-                        shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0][0]
-                        batches = [(t + shift, s) for t, s in batches]
-                        print("\n── Updated Batch Plan ──")
-                        for idx, (start_time, size) in enumerate(batches, 1):
-                            print(f"  Batch {idx}: {size} DMs at {start_time.strftime('%H:%M')}")
+                        shift = (now + timedelta(seconds=random.randint(60, 180))) - batches[0]["start"]
+                        for b in batches:
+                            b["start"] = b["start"] + shift
+                        print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifting schedule to start now.")
+                    else:
+                        print(f"\n[*] First batch is {first_delay_min} min away.")
+                        start_now = input("Start first batch NOW instead? (y/N): ").strip().lower()
+                        if start_now == "y":
+                            now   = datetime.now()
+                            shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0]["start"]
+                            for b in batches:
+                                b["start"] = b["start"] + shift
+                save_batch_plan(batches)
+
+            print(f"── Today's Batch Plan ({len(batches)} batches) ──")
+            for idx, b in enumerate(batches, 1):
+                remaining = b["size"] - b["done"]
+                print(f"  Batch {idx}: {remaining} DMs at {b['start'].strftime('%H:%M')}"
+                      + (f" (done {b['done']}/{b['size']})" if b["done"] else ""))
             print()
 
             # Execute batches
-            for idx, (start_time, size) in enumerate(batches, 1):
-                if datetime.now() < start_time:
-                    wait_until(start_time, label=f"Batch {idx}/{len(batches)} ({size} DMs)")
+            for idx, b in enumerate(batches, 1):
+                remaining = b["size"] - b["done"]
+                if remaining <= 0:
+                    continue
+                if datetime.now() < b["start"]:
+                    wait_until(b["start"], label=f"Batch {idx}/{len(batches)} ({remaining} DMs)")
 
-                print(f"\n── Batch {idx}/{len(batches)} starting at {datetime.now().strftime('%H:%M')} ({size} DMs) ──")
+                print(f"\n── Batch {idx}/{len(batches)} starting at {datetime.now().strftime('%H:%M')} ({remaining} DMs) ──")
                 acc_index, sent, failed = run_batch(
-                    size, pending, templates, accounts, warmup_states, clients, acc_index
+                    remaining, pending, templates, accounts, warmup_states, clients, acc_index
                 )
                 grand_total  += sent
                 grand_failed += failed
+                b["done"]    += sent + failed
+                save_batch_plan(batches)  # persist progress after every batch
                 print(f"── Batch {idx} done: {sent} sent, {failed} failed ──")
 
                 # If all accounts hit limit, no point continuing today
@@ -724,6 +842,9 @@ def main():
                 if not pending:
                     print("\n[✓] No more pending recipients!")
                     break
+
+            # Day's plan exhausted — clear so tomorrow starts fresh
+            clear_batch_plan()
 
         # ── Sleep until tomorrow's active window ──────────────────────────
         if not pending:
