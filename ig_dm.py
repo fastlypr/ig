@@ -991,18 +991,37 @@ def main():
                 # Auto-shift first batch if far away — but ONLY when proxy-local
                 # time is already inside active hours. If proxy is asleep (dead
                 # zone or after 22:00), honor the planned wait.
+                #
+                # IMPORTANT: only shift batches that were originally planned for
+                # TODAY (proxy-local). Next-day batches stay anchored to their
+                # planned times — otherwise they end up at awkward early-morning
+                # hours after the shift.
                 if batches and (batches[0]["start"] - datetime.now()).total_seconds() > 600:
                     first_delay_min = int((batches[0]["start"] - datetime.now()).total_seconds() // 60)
-                    now_proxy = datetime.now(proxy_tz)
-                    in_active = DEAD_ZONE[1] <= now_proxy.hour < 22
+                    now_proxy   = datetime.now(proxy_tz)
+                    today_proxy = now_proxy.date()
+                    in_active   = DEAD_ZONE[1] <= now_proxy.hour < 22
+
+                    def _shift_today_only(batches, shift):
+                        """Apply shift only to batches whose original date is today (proxy-local)."""
+                        moved = 0
+                        for b in batches:
+                            b_local = b["start"].astimezone(proxy_tz) if b["start"].tzinfo else \
+                                      b["start"].replace(tzinfo=datetime.now().astimezone().tzinfo).astimezone(proxy_tz)
+                            if b_local.date() == today_proxy:
+                                b["start"] = b["start"] + shift
+                                moved += 1
+                        return moved
 
                     if args.auto:
                         if in_active:
                             now   = datetime.now()
                             shift = (now + timedelta(seconds=random.randint(60, 180))) - batches[0]["start"]
-                            for b in batches:
-                                b["start"] = b["start"] + shift
-                            print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifting to start now "
+                            moved = _shift_today_only(batches, shift)
+                            kept  = len(batches) - moved
+                            note  = f" ({kept} next-day batch{'es' if kept != 1 else ''} kept at original time)" if kept else ""
+                            print(f"\n[*] Auto mode: first batch was {first_delay_min} min away — shifted "
+                                  f"today's batches to start now{note} "
                                   f"(proxy-local {now_proxy.strftime('%H:%M')} is inside active hours).")
                         else:
                             reason = "dead zone" if now_proxy.hour < DEAD_ZONE[1] else "past active window"
@@ -1017,8 +1036,7 @@ def main():
                             if start_now == "y":
                                 now   = datetime.now()
                                 shift = (now + timedelta(seconds=random.randint(60, 120))) - batches[0]["start"]
-                                for b in batches:
-                                    b["start"] = b["start"] + shift
+                                _shift_today_only(batches, shift)
                 save_batch_plan(batches)
 
             print(f"── Today's Batch Plan ({len(batches)} batches) ──")
