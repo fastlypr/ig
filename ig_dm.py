@@ -307,6 +307,8 @@ def load_warmup(account):
         "day":           1,
         "daily_sent":    0,
         "daily_limit":   WARMUP_START,
+        "daily_target":  WARMUP_START,   # rolled per-day with variance
+        "target_date":   str(date.today()),
         "last_run_date": str(date.today()),
         "total_sent":    0,
     }
@@ -318,23 +320,65 @@ def save_warmup(account, state):
         json.dump(state, f, indent=2)
 
 
+def _roll_daily_target(daily_limit):
+    """Pick today's actual send target with human-like variance.
+
+    Real users don't hit their cap every day. Distribution:
+      ~7%  rest day (0 DMs — sick / busy / traveling)
+      ~10% light day (40-60% of cap — distracted)
+      ~25% chill day (70-90% of cap)
+      ~58% full day (100% of cap)
+    """
+    roll = random.random()
+    if roll < 0.07:
+        return 0  # rest day
+    if roll < 0.17:
+        lo = max(1, int(daily_limit * 0.4))
+        hi = max(lo, int(daily_limit * 0.6))
+        return random.randint(lo, hi)
+    if roll < 0.42:
+        lo = max(1, int(daily_limit * 0.7))
+        hi = max(lo, int(daily_limit * 0.9))
+        return random.randint(lo, hi)
+    return daily_limit  # full-effort day
+
+
 def update_warmup_day(account, state):
     """If it's a new calendar day, reset daily counter and increase limit."""
     today = str(date.today())
     if state["last_run_date"] != today:
         growth    = random.randint(WARMUP_GROWTH_MIN, WARMUP_GROWTH_MAX)
         new_limit = min(state["daily_limit"] + growth, WARMUP_MAX)
-        print(f"  [warmup] New day for @{account}! Limit: {state['daily_limit']} → {new_limit} DMs/day")
+        new_target = _roll_daily_target(new_limit)
+        print(f"  [warmup] New day for @{account}! Limit: {state['daily_limit']} → {new_limit} DMs/day"
+              f"  |  Today's target: {new_target}"
+              + ("  💤 REST DAY" if new_target == 0 else
+                 "  💪 full day" if new_target == new_limit else
+                 f"  📉 light day ({int(new_target/new_limit*100)}%)"))
         state["day"]           += 1
         state["daily_sent"]    = 0
         state["daily_limit"]   = new_limit
+        state["daily_target"]  = new_target
+        state["target_date"]   = today
         state["last_run_date"] = today
+        save_warmup(account, state)
+    elif state.get("target_date") != today:
+        # Existing warmup file from before this feature — backfill today's target
+        state["daily_target"] = _roll_daily_target(state["daily_limit"])
+        state["target_date"]  = today
         save_warmup(account, state)
     return state
 
 
+def effective_limit(state):
+    """Today's actual ceiling = min(daily_limit, daily_target).
+    Falls back to daily_limit for warmup files written before this feature."""
+    target = state.get("daily_target", state["daily_limit"])
+    return min(state["daily_limit"], target)
+
+
 def can_send(account, state):
-    return state["daily_sent"] < state["daily_limit"]
+    return state["daily_sent"] < effective_limit(state)
 
 
 def record_send(account, state):
@@ -478,6 +522,45 @@ def _windows_for_date(d):
     return WEEKEND_WINDOWS if d.weekday() >= 5 else WEEKDAY_WINDOWS
 
 
+def _pick_batch_size(warmup_day, remaining):
+    """Pick a single batch size from a human-like weighted distribution.
+    Capped by remaining DMs left in today's budget.
+
+    Distributions (weights, by warmup day):
+      Day 1-3:  mostly 1-2 DMs (very small sessions)
+      Day 4-7:  1-5, weighted toward 2-3
+      Day 8-14: 1-6, weighted toward 3-4
+      Day 15+:  1-6, weighted toward 3-5
+    """
+    if warmup_day <= 3:
+        # Fresh account — ultra small, looks like quick replies
+        weights = [(1, 50), (2, 35), (3, 15)]
+    elif warmup_day <= 7:
+        weights = [(1, 20), (2, 30), (3, 25), (4, 15), (5, 10)]
+    elif warmup_day <= 14:
+        weights = [(1, 10), (2, 20), (3, 30), (4, 20), (5, 15), (6, 5)]
+    else:
+        weights = [(1, 5), (2, 15), (3, 25), (4, 25), (5, 20), (6, 10)]
+
+    sizes  = [s for s, _ in weights]
+    probs  = [w for _, w in weights]
+    pick   = random.choices(sizes, weights=probs)[0]
+    return min(pick, remaining)
+
+
+def _split_into_batches(total, warmup_day):
+    """Greedy split of total DMs into a list of human-like batch sizes.
+    Order is randomized so largest batches don't always come first."""
+    sizes     = []
+    remaining = total
+    while remaining > 0:
+        s = _pick_batch_size(warmup_day, remaining)
+        sizes.append(s)
+        remaining -= s
+    random.shuffle(sizes)
+    return sizes
+
+
 def plan_batches(total_limit, start_from=None, warmup_day=1, proxy_tz=None):
     """
     Split today's DM budget into randomized batches, weighted by real human
@@ -495,22 +578,10 @@ def plan_batches(total_limit, start_from=None, warmup_day=1, proxy_tz=None):
     if total_limit <= 0:
         return []
 
-    # Batch count scales with warmup day
-    if warmup_day <= 3:
-        batch_count = 1 if total_limit <= 3 else 2
-    elif warmup_day <= 7:
-        batch_count = random.randint(2, 3) if total_limit <= 10 else 3
-    elif warmup_day <= 14:
-        batch_count = random.randint(3, 4)
-    else:
-        batch_count = random.randint(4, 6)
-    batch_count = min(batch_count, total_limit)
-
-    # Split total DMs into batches
-    sizes = [0] * batch_count
-    for _ in range(total_limit):
-        sizes[random.randint(0, batch_count - 1)] += 1
-    sizes = [s for s in sizes if s > 0]
+    # Batch sizes drawn from a weighted distribution per warmup day —
+    # mimics how real users send DMs (sometimes 1, sometimes 5, never identical).
+    # Mean ~3, range 1-6. Smaller days early, fuller distribution as account ages.
+    sizes = _split_into_batches(total_limit, warmup_day)
 
     # Timezone setup
     if proxy_tz is None:
@@ -942,17 +1013,25 @@ def main():
             warmup_states[acc] = load_warmup(acc)
             warmup_states[acc] = update_warmup_day(acc, warmup_states[acc])
 
-        # Today's total capacity = sum of remaining limits across all accounts
+        # Today's total capacity = sum of remaining EFFECTIVE limits across accounts
+        # (effective = min(daily_limit, daily_target) — accounts for variance / rest days)
         total_remaining = sum(
-            max(0, ws["daily_limit"] - ws["daily_sent"])
+            max(0, effective_limit(ws) - ws["daily_sent"])
             for ws in warmup_states.values()
         )
         total_remaining = min(total_remaining, len(pending))
 
         print("── Account Warmup Status ──")
         for acc in accounts:
-            ws = warmup_states[acc]
-            print(f"  @{acc} — Day {ws['day']} | {ws['daily_sent']}/{ws['daily_limit']} today | Total: {ws['total_sent']}")
+            ws  = warmup_states[acc]
+            tgt = effective_limit(ws)
+            tag = ""
+            if tgt == 0:
+                tag = "  💤 REST DAY"
+            elif tgt < ws["daily_limit"]:
+                tag = f"  📉 chill day (target {tgt}/{ws['daily_limit']})"
+            print(f"  @{acc} — Day {ws['day']} | {ws['daily_sent']}/{tgt} today "
+                  f"(cap {ws['daily_limit']}) | Total: {ws['total_sent']}{tag}")
         print(f"\n[+] Total DMs to send today: {total_remaining}\n")
 
         if total_remaining == 0:
