@@ -524,39 +524,58 @@ def _windows_for_date(d):
 
 def _pick_batch_size(warmup_day, remaining):
     """Pick a single batch size from a human-like weighted distribution.
-    Capped by remaining DMs left in today's budget.
+    Range 2-6 DMs (rare 7 at Day 15+). Capped by remaining DMs.
 
-    Distributions (weights, by warmup day):
-      Day 1-3:  mostly 1-2 DMs (very small sessions)
-      Day 4-7:  1-5, weighted toward 2-3
-      Day 8-14: 1-6, weighted toward 3-4
-      Day 15+:  1-6, weighted toward 3-5
+    Weights bias toward asymmetric splits (avoid all-equal patterns).
     """
     if warmup_day <= 3:
-        # Fresh account — ultra small, looks like quick replies
-        weights = [(1, 50), (2, 35), (3, 15)]
+        weights = [(2, 60), (3, 40)]                              # 2-3, mostly 2
     elif warmup_day <= 7:
-        weights = [(1, 20), (2, 30), (3, 25), (4, 15), (5, 10)]
+        weights = [(3, 30), (4, 40), (5, 25), (6, 5)]             # 3-6, asymmetric center on 4
     elif warmup_day <= 14:
-        weights = [(1, 10), (2, 20), (3, 30), (4, 20), (5, 15), (6, 5)]
+        weights = [(3, 20), (4, 30), (5, 30), (6, 20)]            # 3-6, even spread
     else:
-        weights = [(1, 5), (2, 15), (3, 25), (4, 25), (5, 20), (6, 10)]
+        weights = [(3, 10), (4, 25), (5, 30), (6, 30), (7, 5)]    # 4-6 mostly, rare 7
 
-    sizes  = [s for s, _ in weights]
-    probs  = [w for _, w in weights]
-    pick   = random.choices(sizes, weights=probs)[0]
+    sizes = [s for s, _ in weights]
+    probs = [w for _, w in weights]
+    pick  = random.choices(sizes, weights=probs)[0]
     return min(pick, remaining)
 
 
 def _split_into_batches(total, warmup_day):
-    """Greedy split of total DMs into a list of human-like batch sizes.
-    Order is randomized so largest batches don't always come first."""
-    sizes     = []
-    remaining = total
-    while remaining > 0:
-        s = _pick_batch_size(warmup_day, remaining)
-        sizes.append(s)
-        remaining -= s
+    """Greedy split of total DMs into a list of human-like batch sizes (2-6).
+
+    - Avoids stranded 1-DM batches (absorbs into the last batch instead).
+    - Anti-repeat: if all batches end up identical (e.g. [4,4,4]), re-rolls
+      once to force variation when math allows.
+    - Order randomized so largest batches don't always come first.
+    """
+    if total <= 0:
+        return []
+    if total < 2:
+        return [total]
+
+    def _one_split():
+        s = []
+        remaining = total
+        while remaining > 0:
+            pick = _pick_batch_size(warmup_day, remaining)
+            # Avoid leaving a stranded 1
+            if 0 < remaining - pick < 2:
+                pick = remaining
+            s.append(pick)
+            remaining -= pick
+        return s
+
+    sizes = _one_split()
+
+    # Anti-repeat: if 2+ batches all identical, retry once
+    if len(sizes) >= 2 and len(set(sizes)) == 1:
+        retry = _one_split()
+        if len(set(retry)) > 1:
+            sizes = retry
+
     random.shuffle(sizes)
     return sizes
 
